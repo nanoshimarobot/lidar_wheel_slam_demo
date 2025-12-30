@@ -11,7 +11,7 @@ find_package(PCL REQUIRED)
 find_package(Eigen3 REQUIRED)
 find_package(GTSAM REQUIRED)
 find_package(gtsam_points REQUIRED)
-find_package(CUDAToolkit REQUIRED)
+# find_package(CUDAToolkit REQUIRED) # GPUあるときON
 
 ament_auto_find_build_dependencies()
 
