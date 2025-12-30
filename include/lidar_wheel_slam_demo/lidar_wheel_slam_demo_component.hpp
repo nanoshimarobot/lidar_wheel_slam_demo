@@ -213,6 +213,7 @@
 
 #include <pcl/point_cloud.h>
 #include <pcl/point_types.h>
+#include <pcl/filters/filter.h>
 #include <pcl_conversions/pcl_conversions.h>
 
 #include <memory>
@@ -261,6 +262,9 @@ private:
   gtsam_points::PointCloudCPU::Ptr ros_cloud_convert(const sensor_msgs::msg::PointCloud2::SharedPtr pc_msg) {
     pcl::PointCloud<pcl::PointXYZ>::Ptr pcl_cloud = std::make_shared<pcl::PointCloud<pcl::PointXYZ>>();
     pcl::fromROSMsg(*pc_msg, *pcl_cloud);
+
+    std::vector<int> indices;
+    pcl::removeNaNFromPointCloud(*pcl_cloud, *pcl_cloud, indices);
 
     std::vector<Eigen::Vector4d> points;
     points.resize(pcl_cloud->points.size());
@@ -342,13 +346,13 @@ public:
       map_cloud_msg.header.stamp = this->get_clock()->now();
       map_cloud_pub_->publish(map_cloud_msg);
     }
-
   }
 
   void sensor_data_cb(const sensor_msgs::msg::PointCloud2::SharedPtr pc_msg, const geometry_msgs::msg::PoseStamped::SharedPtr odom_msg) {
     if (frames_.empty()) {
       Frame::Ptr init_frame = std::make_shared<Frame>();
       init_frame->cloud = ros_cloud_convert(pc_msg);
+      init_frame->cloud = gtsam_points::voxelgrid_sampling(init_frame->cloud, 0.1, 4);
       init_frame->T_world_robot = Eigen::Isometry3d::Identity();
       frames_.emplace_back(init_frame);
 
@@ -375,19 +379,28 @@ public:
     // append new frame
     Frame::Ptr new_frame = std::make_shared<Frame>();
     new_frame->cloud = ros_cloud_convert(pc_msg);
-    new_frame->cloud = gtsam_points::voxelgrid_sampling(new_frame->cloud, 0.05, 4);
+    new_frame->cloud = gtsam_points::voxelgrid_sampling(new_frame->cloud, 0.1, 4);
     frames_.emplace_back(new_frame);
     const size_t k = frames_.size() - 1;
     const Eigen::Isometry3d init_T_world_robot = frames_[k - 1]->T_world_robot * wheel_T_pr_cr;
 
     // Add initial value for new variable to Values
+    // estimate_.insert(X(k), gtsam::Pose3());
     estimate_.insert(X(k), gtsam::Pose3(init_T_world_robot.matrix()));
 
     auto between_noise = gtsam::noiseModel::Isotropic::Precision(6, 1.0);
-    graph_.emplace_shared<gtsam::BetweenFactor<gtsam::Pose3>>(X(k - 1), X(k), gtsam::Pose3(wheel_T_pr_cr.matrix()), between_noise);
+    // auto between_noise = gtsam::noiseModel::Diagonal::Sigmas((gtsam::Vector(6) << 0.2,
+    //                                                           0.2,
+    //                                                           0.2,  // xyz [m]
+    //                                                           0.1,
+    //                                                           0.1,
+    //                                                           0.1  // rpy [rad]
+    //                                                           )
+    //                                                            .finished());
+    // graph_.emplace_shared<gtsam::BetweenFactor<gtsam::Pose3>>(X(k - 1), X(k), gtsam::Pose3(wheel_T_pr_cr.inverse().matrix()), between_noise);
 
     auto icp_factor = gtsam::make_shared<gtsam_points::IntegratedICPFactor>(X(k - 1), X(k), frames_[k - 1]->cloud, new_frame->cloud);
-    icp_factor->set_max_correspondence_distance(0.5);
+    icp_factor->set_max_correspondence_distance(0.3);
     graph_.add(icp_factor);
 
     // graph_.emplace_shared<gtsam_points::IntegratedICPFactor>(X(k - 1), X(k), frames_[k - 1]->cloud, new_frame->cloud);
@@ -398,8 +411,8 @@ public:
 
   void optimize() {
     gtsam::LevenbergMarquardtParams params;
-    params.setMaxIterations(50);
-
+    params.setMaxIterations(10);
+    params.setVerbosityLM("SUMMARY");
     gtsam::LevenbergMarquardtOptimizer optimizer(graph_, estimate_, params);
     gtsam::Values result = optimizer.optimize();
     estimate_ = result;
@@ -417,19 +430,20 @@ public:
 
     // update map cloud
     map_cloud_ = std::make_shared<pcl::PointCloud<pcl::PointXYZ>>();
-    RCLCPP_INFO(this->get_logger(),"create map cloud");
+    RCLCPP_INFO(this->get_logger(), "create map cloud");
     for (size_t i = 0; i < frames_.size(); i++) {
       // if(i % 5 != 0) continue;  // downsample for visualization
       gtsam_points::PointCloudCPU::Ptr cloud_lidar = frames_[i]->cloud;
       pcl::PointCloud<pcl::PointXYZ>::Ptr cloud_world = std::make_shared<pcl::PointCloud<pcl::PointXYZ>>();
       cloud_world->points.resize(cloud_lidar->size());
-      for(size_t j = 0; j < cloud_lidar->size(); ++j){
-        Eigen::Vector4d& p_lidar = cloud_lidar->points[j];
-        Eigen::Vector4d p_world = frames_[i]->T_world_robot * p_lidar;
+      for (size_t j = 0; j < cloud_lidar->size(); ++j) {
+        const Eigen::Vector4d& p_lidar = cloud_lidar->points_storage[j];  // ←統一
+        const Eigen::Vector4d p_world = frames_[i]->T_world_robot.matrix() * p_lidar;
         cloud_world->points[j].x = static_cast<float>(p_world.x());
         cloud_world->points[j].y = static_cast<float>(p_world.y());
         cloud_world->points[j].z = static_cast<float>(p_world.z());
       }
+
       RCLCPP_INFO(this->get_logger(), "kotekote");
       *map_cloud_ += *cloud_world;
     }
